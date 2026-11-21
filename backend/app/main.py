@@ -251,6 +251,100 @@ def governance_pipeline(
     }
 
 
+# ---- 数据流6: 切片复现档案（切片模板×输入数据）与报表回溯 ----
+@app.post("/api/analytics/slice-archive")
+def create_slice_archive(
+    template_id: int,
+    report_task_id: int | None = None,
+    simulate_write_failure: bool = False,
+    data: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """归档切片复现文件：保全取数条件、原始行序和逐行命中/筛掉判定。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.create_archive(
+        template_id, data or [],
+        report_task_id=report_task_id,
+        simulate_write_failure=simulate_write_failure,
+    )
+
+
+@app.get("/api/analytics/slice-archive")
+def list_slice_archives() -> dict[str, Any]:
+    """列出全部切片复现档案（摘要）。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.list_archives()
+
+
+@app.get("/api/analytics/slice-archive/{archive_id}")
+def get_slice_archive(archive_id: int) -> dict[str, Any]:
+    """查询切片复现档案明细：真实取数条件、历史统计行、命中与被筛掉的行。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.get_archive(archive_id)
+
+
+@app.post("/api/analytics/slice-archive/{archive_id}/retry")
+def retry_slice_archive(
+    archive_id: int, data: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """档案写入失败后的重试；源分区已清退时以首次捕获快照落盘并标明可复核范围。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.retry_archive(archive_id, data=data)
+
+
+@app.post("/api/analytics/slice-archive/{archive_id}/compare")
+def compare_slice_archive(
+    archive_id: int, data: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """用现行（可能已修订的）模板对当前数据跑切片，与档案覆盖范围对比。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.compare_archive_with_current(archive_id, data or [])
+
+
+@app.post("/api/analytics/slice-template/{template_id}/revise")
+def revise_slice_template(
+    template_id: int, changes: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """修订模板取数条件（如放宽过滤条件）；已归档的复现文件保持当时版本。"""
+    svc = service_for("slice_query")
+    if svc is None:
+        return {"ok": False, "message": "切片服务未就绪"}
+    return svc.revise_template(template_id, changes or {})
+
+
+@app.post("/api/analytics/adhoc-export/{task_id}/submit")
+def submit_adhoc_export(
+    task_id: int,
+    archive_id: int | None = None,
+    data: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """提交即席导出，并把切片复现档案关联到当期报表。"""
+    svc = service_for("adhoc_export")
+    if svc is None:
+        return {"ok": False, "message": "导出服务未就绪"}
+    if data is None:
+        data = _sample_behavior_data()
+    return svc.submit_export(task_id, data, archive_id=archive_id)
+
+
+@app.get("/api/analytics/adhoc-export/{task_id}/lineage")
+def adhoc_export_lineage(task_id: int) -> dict[str, Any]:
+    """旧报表汇总回溯：统计行、真实取数条件和实际参与计算的交易明细。"""
+    svc = service_for("adhoc_export")
+    if svc is None:
+        return {"ok": False, "message": "导出服务未就绪"}
+    return svc.get_export_lineage(task_id)
+
+
 # ----  天平 ----
 @app.get("/api/analytics/lineage/{node_id}/upstream")
 def lineage_upstream(node_id: str) -> dict[str, Any]:

@@ -729,6 +729,256 @@ def recommend_materialization(
 
 
 # ---------------------------------------------------------------------------
+# 切片复现：逐行判定、统计行与覆盖对比
+# ---------------------------------------------------------------------------
+
+SLICE_FILTER_OPS = (">=", "<=", "!=", ">", "<", "=")
+
+
+def _parse_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_slice_dim_values(dim_values_raw: str) -> list[dict[str, str]]:
+    """解析查询维值表达式：``城市=北京;事件类型=页面访问`` → [{field, value}]。"""
+    conditions: list[dict[str, str]] = []
+    for part in str(dim_values_raw or "").split(";"):
+        if "=" in part:
+            field, val = part.strip().split("=", 1)
+            conditions.append({"field": field.strip(), "value": val.strip()})
+    return conditions
+
+
+def parse_slice_filter_expr(filter_expr: str) -> list[dict[str, str]]:
+    """解析切片过滤表达式：``amount>=500;city!=北京`` → [{field, op, value, raw}]。"""
+    conditions: list[dict[str, str]] = []
+    for part in str(filter_expr or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        for op in SLICE_FILTER_OPS:
+            if op in part:
+                field, val = part.split(op, 1)
+                conditions.append({
+                    "field": field.strip(), "op": op,
+                    "value": val.strip(), "raw": part,
+                })
+                break
+    return conditions
+
+
+def match_slice_dim_values(
+    row: dict[str, Any], dim_conditions: list[dict[str, str]],
+) -> bool:
+    """单行判定查询维值（全部维值条件都满足才通过）。"""
+    return all(
+        str(row.get(cond["field"], "")) == cond["value"]
+        for cond in dim_conditions
+    )
+
+
+def _compare_num(a: float, b: float, op: str) -> bool:
+    if op == ">":
+        return a > b
+    if op == "<":
+        return a < b
+    if op == ">=":
+        return a >= b
+    if op == "<=":
+        return a <= b
+    if op == "!=":
+        return a != b
+    return a == b
+
+
+def _compare_str(a: str, b: str, op: str) -> bool:
+    if op == "!=":
+        return a != b
+    if op == ">":
+        return a > b
+    if op == "<":
+        return a < b
+    return b in a
+
+
+def match_slice_filter_condition(
+    row: dict[str, Any], field: str, op: str, val: str,
+) -> bool:
+    """单行判定一条切片过滤条件（与历史集合过滤语义一致）。
+
+    单元格无法转成数值时视为不匹配（历史实现会直接抛错中断查询）。
+    """
+    try:
+        val_num = float(val)
+        is_numeric = True
+    except ValueError:
+        is_numeric = False
+    cell = row.get(field)
+    if is_numeric:
+        try:
+            cell_num = float(cell) if cell is not None else 0.0
+        except (ValueError, TypeError):
+            return False
+        return _compare_num(cell_num, val_num, op)
+    cell_str = str(cell if cell is not None else "").lower()
+    return _compare_str(cell_str, val.lower(), op)
+
+
+def run_slice_with_lineage(
+    template_cfg: dict[str, Any], data: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """执行切片查询并逐行记录命运，供切片复现文件归档使用。
+
+    返回 {
+        verdicts: [{source_seq, row, kept, dropped_stage, drop_reason, result_rank}],
+        result_rows: 命中行（排序截断后，与 execute_slice_query 输出一致）,
+        total_rows: 截断前命中数,
+        row_limit: 返回行数上限,
+    }
+    """
+    dim_values_raw = str(template_cfg.get("查询维值", "") or "")
+    filter_expr = str(template_cfg.get("过滤条件", "") or "")
+    sort_expr = str(template_cfg.get("排序规则", "") or "")
+    row_limit = _parse_int(template_cfg.get("返回行数"), 100)
+
+    dim_conditions = parse_slice_dim_values(dim_values_raw)
+    filter_conditions = parse_slice_filter_expr(filter_expr)
+
+    verdicts: list[dict[str, Any]] = []
+    survivors: list[int] = []  # 通过维值筛选和过滤条件的 verdict 下标
+    for seq, row in enumerate(data, start=1):
+        verdict: dict[str, Any] = {
+            "source_seq": seq,          # 原始行序：输入数据中的位置（从 1 开始）
+            "row": dict(row),           # 行内容快照，分区清退后仍可复核
+            "kept": False,
+            "dropped_stage": None,
+            "drop_reason": None,
+            "result_rank": None,
+        }
+        if dim_conditions and not match_slice_dim_values(row, dim_conditions):
+            verdict["dropped_stage"] = "维值筛选"
+            verdict["drop_reason"] = dim_values_raw
+        else:
+            failed = next(
+                (
+                    cond for cond in filter_conditions
+                    if not match_slice_filter_condition(
+                        row, cond["field"], cond["op"], cond["value"],
+                    )
+                ),
+                None,
+            )
+            if failed is not None:
+                verdict["dropped_stage"] = "过滤条件"
+                verdict["drop_reason"] = failed["raw"]
+            else:
+                survivors.append(len(verdicts))
+        verdicts.append(verdict)
+
+    total_rows = len(survivors)
+
+    # 排序（仅对通过过滤的行；数值优先，转换失败回退字符串序）
+    if sort_expr and survivors:
+        sort_parts = sort_expr.rsplit(":", 1)
+        sort_field = sort_parts[0].strip()
+        reverse = len(sort_parts) > 1 and sort_parts[1].strip().upper() == "DESC"
+        try:
+            survivors.sort(
+                key=lambda i: float(verdicts[i]["row"].get(sort_field, 0)),
+                reverse=reverse,
+            )
+        except (ValueError, TypeError):
+            survivors.sort(
+                key=lambda i: str(verdicts[i]["row"].get(sort_field, "")),
+                reverse=reverse,
+            )
+
+    # 截断：超出返回行数的行记为被行数截断筛掉
+    kept_indices = survivors[:row_limit]
+    for rank, idx in enumerate(kept_indices, start=1):
+        verdicts[idx]["kept"] = True
+        verdicts[idx]["result_rank"] = rank
+    for idx in survivors[row_limit:]:
+        verdicts[idx]["dropped_stage"] = "行数截断"
+        verdicts[idx]["drop_reason"] = f"返回行数上限 {row_limit}"
+
+    return {
+        "verdicts": verdicts,
+        "result_rows": [verdicts[idx]["row"] for idx in kept_indices],
+        "total_rows": total_rows,
+        "row_limit": row_limit,
+    }
+
+
+def summarize_slice_verdicts(verdicts: list[dict[str, Any]]) -> dict[str, int]:
+    """切片统计行：输入总数、命中数和各阶段筛掉数。"""
+    return {
+        "input_rows": len(verdicts),
+        "kept_rows": sum(1 for v in verdicts if v["kept"]),
+        "dropped_rows": sum(1 for v in verdicts if not v["kept"]),
+        "dropped_by_dim": sum(1 for v in verdicts if v["dropped_stage"] == "维值筛选"),
+        "dropped_by_filter": sum(1 for v in verdicts if v["dropped_stage"] == "过滤条件"),
+        "dropped_by_limit": sum(1 for v in verdicts if v["dropped_stage"] == "行数截断"),
+    }
+
+
+def slice_row_fingerprint(row: dict[str, Any]) -> str:
+    """单行内容指纹，用于跨快照比对同一笔交易。"""
+    raw = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def slice_input_fingerprint(data: list[dict[str, Any]]) -> str:
+    """输入数据指纹：切片复现文件按「模板×输入数据」归档的键组成部分。"""
+    raw = json.dumps(data, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def slice_template_fingerprint(template_cfg: dict[str, Any]) -> str:
+    """模板取数条件指纹：模板被修订后可证明档案用的是当时版本。"""
+    relevant = {
+        key: str(template_cfg.get(key, "") or "")
+        for key in ("查询维值", "过滤条件", "排序规则", "返回行数")
+    }
+    raw = json.dumps(relevant, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def compare_slice_coverage(
+    archive_verdicts: list[dict[str, Any]],
+    current_verdicts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """对比档案与现行切片的覆盖范围（按行内容指纹匹配同一笔交易）。"""
+    archive_kept = [v for v in archive_verdicts if v["kept"]]
+    archive_dropped = [v for v in archive_verdicts if not v["kept"]]
+    current_kept = [v for v in current_verdicts if v["kept"]]
+    current_dropped = [v for v in current_verdicts if not v["kept"]]
+
+    archive_kept_fps = {slice_row_fingerprint(v["row"]) for v in archive_kept}
+    current_kept_fps = {slice_row_fingerprint(v["row"]) for v in current_kept}
+
+    return {
+        "archive_kept": archive_kept,
+        "archive_dropped": archive_dropped,
+        "current_kept": current_kept,
+        "current_dropped": current_dropped,
+        # 过滤条件放宽后，现行切片新增覆盖的行（当时被筛掉、现在命中）
+        "newly_covered_by_current": [
+            v for v in current_kept
+            if slice_row_fingerprint(v["row"]) not in archive_kept_fps
+        ],
+        # 当时命中、现行切片不再覆盖的行
+        "only_kept_in_archive": [
+            v for v in archive_kept
+            if slice_row_fingerprint(v["row"]) not in current_kept_fps
+        ],
+    }
+
+
+# ---------------------------------------------------------------------------
 # 导出任务调度器
 # ---------------------------------------------------------------------------
 

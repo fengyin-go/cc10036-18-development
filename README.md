@@ -77,5 +77,28 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 切片复现档案
+
+切片查询结果可按「切片模板 × 输入数据」归档为复现文件，原明细分区退役后仍可复查：
+
+- `POST /api/analytics/slice-archive` 归档切片复现文件：保全取数条件（模板快照+指纹）、
+  原始行序和逐行命中/筛掉判定；`report_task_id` 可把档案关联到当期报表（即席导出任务）。
+- `GET /api/analytics/slice-archive/{id}` 查档案明细：历史统计行、真实取数条件、
+  命中与被筛掉的行（含筛掉阶段和原因）。
+- `POST /api/analytics/slice-archive/{id}/retry` 写入失败后重试；源分区已清退时以首次
+  捕获快照落盘，并在 `review_scope` 里标明可复核范围。
+- `POST /api/analytics/slice-template/{id}/revise` 修订模板取数条件（如放宽过滤），
+  已归档文件保持当时版本。
+- `POST /api/analytics/slice-archive/{id}/compare` 用现行模板跑当前数据，对比档案明细
+  与现行切片分别覆盖哪几笔。
+- `POST /api/analytics/adhoc-export/{id}/submit?archive_id=` 提交导出并关联档案；
+  `GET /api/analytics/adhoc-export/{id}/lineage` 让旧报表汇总回溯实际参与计算的明细。
+
+端到端演示（两笔位于旧模板门槛两侧的订单：存档 → 放宽过滤 → 对比覆盖）：
+
+```bash
+cd backend && .venv/bin/python scripts/demo_slice_archive.py
+```
+
 领域：数据工程
 子方向：数据分析与数据应用

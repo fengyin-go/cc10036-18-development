@@ -9,6 +9,7 @@ import tempfile
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.slice_query import ARCHIVE_COLLECTION
 from app.store import store
 from app.analytics_engine import ExportScheduler
 
@@ -31,8 +32,9 @@ class AdhocExportService(BaseModuleService):
 
     def submit_export(
         self, task_id: int, query_data: list[dict[str, Any]],
+        archive_id: int | None = None,
     ) -> dict[str, Any]:
-        """提交导出任务并异步执行。"""
+        """提交导出任务并异步执行；可同时把切片复现档案关联到当期报表。"""
         task = store.find(self.MODULE, task_id)
         if task is None:
             return {"ok": False, "message": f"导出任务 {task_id} 不存在"}
@@ -56,7 +58,7 @@ class AdhocExportService(BaseModuleService):
                 query_data[:row_limit], export_format, compressed,
             )
             self.run_action(task_id, "完成导出")
-            return {
+            result: dict[str, Any] = {
                 "ok": True,
                 "task_id": task_id,
                 "task_name": str(task.get("任务名称", "")),
@@ -69,9 +71,68 @@ class AdhocExportService(BaseModuleService):
                     else file_content[:500].decode("utf-8", errors="replace")
                 ),
             }
+            if archive_id is not None:
+                result["archive_link"] = self.link_archive(task_id, archive_id)
+            return result
         except Exception as exc:
             self.run_action(task_id, "标记失败")
             return {"ok": False, "message": f"导出失败: {exc}"}
+
+    def link_archive(self, task_id: int, archive_id: int) -> dict[str, Any]:
+        """把切片复现档案关联到导出任务，旧报表汇总由此可回溯明细。"""
+        task = store.find(self.MODULE, task_id)
+        if task is None:
+            return {"ok": False, "message": f"导出任务 {task_id} 不存在"}
+        archive = store.find_doc(ARCHIVE_COLLECTION, archive_id)
+        if archive is None:
+            return {"ok": False, "message": f"切片复现档案 {archive_id} 不存在"}
+        task["关联档案"] = archive_id
+        refs = archive.setdefault("report_refs", [])
+        if not any(int(ref.get("task_id", 0)) == int(task_id) for ref in refs):
+            refs.append({
+                "module": self.MODULE,
+                "task_id": task_id,
+                "任务名称": str(task.get("任务名称", "")),
+            })
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "archive_id": archive_id,
+            "message": f"切片复现档案 {archive_id} 已关联到导出任务 {task_id}",
+        }
+
+    def get_export_lineage(self, task_id: int) -> dict[str, Any]:
+        """报表回溯：旧报表汇总 → 实际参与计算的交易明细与真实取数条件。"""
+        task = store.find(self.MODULE, task_id)
+        if task is None:
+            return {"ok": False, "message": f"导出任务 {task_id} 不存在"}
+        archive_id = task.get("关联档案")
+        if archive_id is None:
+            return {"ok": False, "message": f"导出任务 {task_id} 未关联切片复现档案"}
+        archive = store.find_doc(ARCHIVE_COLLECTION, int(archive_id))
+        if archive is None:
+            return {"ok": False, "message": f"关联的切片复现档案 {archive_id} 不存在"}
+        rows = archive.get("rows", [])
+        return {
+            "ok": True,
+            "task": {
+                "id": task.get("id"),
+                "任务名称": str(task.get("任务名称", "")),
+                "status": str(task.get("status", "")),
+                "创建时间": str(task.get("创建时间", "")),
+            },
+            "archive": {
+                "id": archive.get("id"),
+                "archive_key": archive.get("archive_key"),
+                "status": archive.get("status"),
+                "archive_basis": archive.get("archive_basis"),
+                "取数条件": archive.get("template_snapshot"),
+                "统计行": archive.get("stats"),
+                "实际参与计算的明细": [v for v in rows if v.get("kept")],
+                "当时筛掉的明细": [v for v in rows if not v.get("kept")],
+                "复核范围": archive.get("review_scope"),
+            },
+        }
 
     def batch_export(
         self, task_ids: list[int], query_data: list[dict[str, Any]],

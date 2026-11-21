@@ -14,6 +14,8 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 内部文档集合（如切片复现档案）：不进业务模块清单，不参与概览统计
+        self._docs: dict[str, list[dict[str, Any]]] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -25,6 +27,16 @@ class Store:
         for row in self.rows(module):
             if int(row.get("id", 0)) == entry_id:
                 return row
+        return None
+
+    def docs(self, collection: str) -> list[dict[str, Any]]:
+        """内部文档集合（跨模块共享，但不作为业务模块暴露）。"""
+        return self._docs.setdefault(collection, [])
+
+    def find_doc(self, collection: str, doc_id: int) -> dict[str, Any] | None:
+        for doc in self.docs(collection):
+            if int(doc.get("id", 0)) == int(doc_id):
+                return doc
         return None
 
     def overview(self) -> dict[str, object]:
